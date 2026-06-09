@@ -23,7 +23,7 @@ from spectra.analysis.spectrum import (
     spectral_decay_rate,
 )
 from spectra.core.manifest import build_manifest
-from spectra.formats.stz import pack
+from spectra.formats.stz import pack, unpack_manifest, unpack_tensors
 from spectra.loaders.numpy_loader import load
 from spectra.transforms.quantize import quantize_fp16, quantize_int8, dequantize_int8
 from spectra.transforms.sparsify import sparsify, reconstruct_coo
@@ -599,10 +599,134 @@ def compress(file: str = typer.Argument(...)):
 
 
 @app.command()
-def extract(file: str = typer.Argument(...)):
-    """Reconstruct tensors from a .stz archive. (Phase 10)"""
-    typer.echo("extract: not yet implemented", err=True)
-    raise typer.Exit(1)
+def extract(
+    file: str = typer.Argument(..., help="Path to .stz archive"),
+    out: Optional[str] = typer.Option(None, "--out", help="Output path (default: <input>.npz)"),
+    format: str = typer.Option("npz", "--format", help="npz | npy (single tensor only)"),
+    tensor: Optional[str] = typer.Option(None, "--tensor", help="Extract a single named tensor"),
+    original_dtype: bool = typer.Option(True, "--original-dtype/--no-original-dtype",
+                                        help="Cast back to original dtype on extract"),
+    report: bool = typer.Option(False, "--report/--no-report", help="Show reconstruction report"),
+):
+    """Reconstruct tensors from a .stz archive."""
+
+    if format not in ("npz", "npy"):
+        typer.echo("--format must be npz or npy", err=True)
+        raise typer.Exit(1)
+
+    # Default output path
+    out_path = out or (os.path.splitext(file)[0] + ".npz")
+
+    # Load manifest and raw arrays
+    try:
+        manifest = unpack_manifest(file)
+    except Exception as e:
+        typer.echo(f"Error reading manifest: {e}", err=True)
+        raise typer.Exit(1)
+
+    tensor_meta = manifest["tensors"]
+
+    # Filter to single tensor if requested
+    if tensor is not None:
+        if tensor not in tensor_meta:
+            typer.echo(f"Tensor '{tensor}' not found in archive.", err=True)
+            raise typer.Exit(1)
+        tensor_meta = {tensor: tensor_meta[tensor]}
+
+    # Load all raw arrays needed for the requested tensors
+    needed_keys: list[str] = []
+    for meta in tensor_meta.values():
+        needed_keys.extend(meta.get("keys", []))
+
+    try:
+        raw = unpack_tensors(file, keys=needed_keys)
+    except Exception as e:
+        typer.echo(f"Error loading tensors: {e}", err=True)
+        raise typer.Exit(1)
+
+    # Reconstruct each tensor
+    _NOT_YET = {"svd", "tucker", "tucker_wavelet", "svd_wavelet"}
+
+    reconstructed: dict[str, np.ndarray] = {}
+    report_rows: list[dict] = []
+
+    for name, meta in tensor_meta.items():
+        storage = meta["storage_type"]
+
+        if storage in _NOT_YET:
+            typer.echo(
+                f"Error: storage_type '{storage}' for tensor '{name}' "
+                "requires SVD/Tucker (Phase 13). Cannot extract yet.",
+                err=True,
+            )
+            raise typer.Exit(1)
+
+        orig_dtype = np.dtype(meta["original_dtype"]) if original_dtype else None
+
+        if storage == "dense":
+            arr = raw[meta["keys"][0]]
+            if orig_dtype is not None:
+                arr = arr.astype(orig_dtype)
+
+        elif storage == "quantized_fp16":
+            arr = raw[meta["keys"][0]]
+            if orig_dtype is not None:
+                arr = arr.astype(orig_dtype)
+
+        elif storage == "quantized_int8":
+            q = raw[meta["keys"][0]]
+            arr = dequantize_int8(q, meta["scale"], meta["zero_point"],
+                                  orig_dtype if orig_dtype is not None else np.float32)
+
+        elif storage == "sparse_coo":
+            indices = raw[f"{name}__indices"]
+            values  = raw[f"{name}__values"]
+            shape   = tuple(meta["original_shape"])
+            arr = reconstruct_coo(indices, values, shape,
+                                  dtype=orig_dtype if orig_dtype is not None else values.dtype)
+
+        else:
+            typer.echo(f"Warning: unknown storage_type '{storage}' for '{name}', skipping.", err=True)
+            continue
+
+        reconstructed[name] = arr
+
+        if report:
+            report_rows.append({
+                "name": name,
+                "storage": storage,
+                "shape": arr.shape,
+                "dtype": str(arr.dtype),
+                "lossless": meta.get("lossless", True),
+                "mse": meta.get("reconstruction_error_mse"),
+                "rel": meta.get("reconstruction_error_relative"),
+            })
+
+    # Write output
+    if format == "npy":
+        if len(reconstructed) != 1:
+            typer.echo("--format npy requires exactly one tensor (use --tensor NAME)", err=True)
+            raise typer.Exit(1)
+        arr = next(iter(reconstructed.values()))
+        np.save(out_path if out_path.endswith(".npy") else out_path.replace(".npz", ".npy"), arr)
+        final_path = out_path if out_path.endswith(".npy") else out_path.replace(".npz", ".npy")
+    else:
+        np.savez(out_path, **reconstructed)
+        final_path = out_path
+
+    # Report
+    if report:
+        rprint("\n[bold]Extraction Report[/bold]")
+        rprint("─" * 55)
+        for r in report_rows:
+            shape_str = "x".join(str(d) for d in r["shape"])
+            lossless_str = "[green]lossless[/green]" if r["lossless"] else "[yellow]lossy[/yellow]"
+            rprint(f"\n[cyan]{r['name']}[/cyan]  {r['dtype']} [{shape_str}]  {lossless_str}")
+            rprint(f"  storage: {r['storage']}")
+            if not r["lossless"] and r["mse"] is not None:
+                rprint(f"  MSE: {r['mse']:.6f}  |  Relative error: {r['rel']*100:.3f}%")
+
+    rprint(f"\nExtracted {len(reconstructed)} tensor(s) → [green]{final_path}[/green]")
 
 
 @app.command()
