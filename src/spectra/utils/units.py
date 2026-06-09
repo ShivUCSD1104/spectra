@@ -23,8 +23,14 @@ def fmt_bytes(n: int) -> str:
 
 
 def parse_size(s: str) -> int:
-    """Parse a human-readable size string into bytes (e.g. '10MB' → 10485760)."""
+    """Parse a human-readable size string into bytes (e.g. '10MB' → 10485760).
+
+    Bare integers (e.g. '0', '1024') are treated as bytes.
+    """
     s = s.strip()
+    # Bare integer — treat as bytes
+    if re.fullmatch(r"[0-9]+", s):
+        return int(s)
     match = re.fullmatch(r"([0-9]*\.?[0-9]+)\s*([a-zA-Z]+)", s)
     if not match:
         raise ValueError(f"Cannot parse size: '{s}'. Expected format like '10MB', '1.5GB'.")

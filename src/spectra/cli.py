@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import csv
+import fnmatch
 import json
+import os
 import sys
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import typer
@@ -20,7 +22,11 @@ from spectra.analysis.spectrum import (
     randomized_svd_top_k,
     spectral_decay_rate,
 )
+from spectra.core.manifest import build_manifest
+from spectra.formats.stz import pack
 from spectra.loaders.numpy_loader import load
+from spectra.transforms.quantize import quantize_fp16, quantize_int8, dequantize_int8
+from spectra.transforms.sparsify import sparsify, reconstruct_coo
 from spectra.utils.display import make_tensor_table, print_summary_block
 from spectra.utils.units import fmt_bytes, parse_size
 
@@ -308,13 +314,281 @@ def inspect(
         })
 
 
-# ── stub commands (implemented in later phases) ───────────────────────────────
+# ── helpers shared by transform / compress ───────────────────────────────────
+
+def _tensor_matches(name: str, select: Optional[str], exclude: Optional[str]) -> bool:
+    if select is not None and not fnmatch.fnmatch(name, select):
+        return False
+    if exclude is not None and fnmatch.fnmatch(name, exclude):
+        return False
+    return True
+
+
+def _passthrough_record(name: str, arr: np.ndarray) -> dict:
+    return {
+        "name": name,
+        "storage_type": "dense",
+        "original_shape": list(arr.shape),
+        "original_dtype": str(arr.dtype),
+        "lossless": True,
+        "reconstruction_method": "load directly",
+        "size_original_bytes": arr.nbytes,
+        "size_stored_bytes": arr.nbytes,
+        "compression_ratio": 1.0,
+        "keys": [name],
+    }
+
+
+def _default_out(file: str) -> str:
+    base = os.path.splitext(file)[0]
+    return base + ".stz"
+
+
+def _reconstruction_errors(original: np.ndarray, restored: np.ndarray) -> tuple[float, float]:
+    orig64 = original.astype(np.float64).ravel()
+    rest64 = restored.astype(np.float64).ravel()
+    mse = float(np.mean((orig64 - rest64) ** 2))
+    norm_orig = float(np.linalg.norm(orig64))
+    rel = float(np.linalg.norm(orig64 - rest64) / (norm_orig + 1e-12))
+    return mse, rel
+
+
+def _print_transform_report(
+    results: list[dict],
+    out_path: Optional[str],
+    dry_run: bool,
+) -> None:
+    rprint("\n[bold]Transform Report[/bold]")
+    rprint("─" * 65)
+
+    total_original = 0
+    total_stored = 0
+    max_rel_err = 0.0
+    transformed_count = 0
+
+    for r in results:
+        shape_str = "x".join(str(d) for d in r["shape"])
+        rprint(f"\n[cyan]{r['name']}[/cyan]  {r['dtype']} [{shape_str}]")
+
+        if r.get("skipped"):
+            rprint(f"  → Skipped ({r['reason']})")
+        else:
+            rprint(f"  → {r['transform']}")
+            orig_str = fmt_bytes(r["size_original"])
+            stor_str = fmt_bytes(r["size_stored"])
+            ratio = r["size_original"] / (r["size_stored"] + 1e-12)
+            rprint(f"  → {orig_str} → {stor_str}  ({ratio:.1f}x)")
+            if r.get("mse") is not None:
+                rprint(f"  → MSE: {r['mse']:.4f}  |  Relative error: {r['rel_err']*100:.2f}%")
+            transformed_count += 1
+            max_rel_err = max(max_rel_err, r.get("rel_err") or 0.0)
+
+        total_original += r["size_original"]
+        total_stored += r.get("size_stored", r["size_original"])
+
+    rprint("\n[bold]Summary[/bold]")
+    rprint(f"  Tensors transformed:  {transformed_count} / {len(results)}")
+    rprint(f"  Original size:        {fmt_bytes(total_original)}")
+    rprint(f"  Stored size:          {fmt_bytes(total_stored)}")
+    overall = total_original / (total_stored + 1e-12)
+    rprint(f"  Overall ratio:        {overall:.1f}x")
+    if max_rel_err > 0:
+        rprint(f"  Max relative error:   {max_rel_err*100:.2f}%")
+    if not dry_run and out_path:
+        rprint(f"  Written to: [green]{out_path}[/green]")
+    elif dry_run:
+        rprint("  [yellow](dry run — nothing written)[/yellow]")
+
+
+# ── transform command ─────────────────────────────────────────────────────────
 
 @app.command()
-def transform(file: str = typer.Argument(...)):
-    """Apply explicit transforms to tensors. (Phase 9)"""
-    typer.echo("transform: not yet implemented", err=True)
-    raise typer.Exit(1)
+def transform(
+    file: str = typer.Argument(..., help="Input file (.npy, .npz)"),
+    out: Optional[str] = typer.Option(None, "--out", help="Output .stz path (default: <input>.stz)"),
+    quantize: Optional[str] = typer.Option(None, "--quantize", help="fp16 | int8"),
+    factorize: Optional[str] = typer.Option(None, "--factorize", help="svd | tucker (Phase 13)"),
+    rank: Optional[int] = typer.Option(None, "--rank", help="Fixed SVD rank"),
+    sparsify_threshold: Optional[float] = typer.Option(None, "--sparsify", help="Zero out abs(x) < threshold"),
+    select: Optional[str] = typer.Option(None, "--select", help="Glob pattern to select tensors"),
+    exclude: Optional[str] = typer.Option(None, "--exclude", help="Glob pattern to exclude tensors"),
+    min_size: str = typer.Option("0", "--min-size", help="Skip tensors smaller than this (e.g. 1MB)"),
+    skip_1d: bool = typer.Option(True, "--skip-1d/--no-skip-1d", help="Skip 1D tensors for --factorize"),
+    dry_run: bool = typer.Option(False, "--dry-run/--no-dry-run", help="Show plan, write nothing"),
+    report: bool = typer.Option(True, "--report/--no-report", help="Print per-tensor report"),
+    binary_compress: str = typer.Option("zstd", "--binary-compress", help="zstd | gzip | xz | zlib | none"),
+    binary_level: Optional[int] = typer.Option(None, "--binary-level", help="Compression level"),
+):
+    """Apply explicit transforms to all tensors (or a selection). Outputs a .stz archive."""
+
+    # --factorize not yet available
+    if factorize is not None:
+        typer.echo(
+            "Error: --factorize is not yet implemented. "
+            "SVD/Tucker factorization is added in Phase 13. "
+            "Use --quantize or --sparsify instead.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    if quantize is not None and quantize not in ("fp16", "int8"):
+        typer.echo("--quantize must be fp16 or int8", err=True)
+        raise typer.Exit(1)
+
+    min_size_bytes = parse_size(min_size)
+    out_path = out or _default_out(file)
+
+    # Load
+    try:
+        artifact = load(file)
+    except Exception as e:
+        typer.echo(f"Error loading file: {e}", err=True)
+        raise typer.Exit(1)
+
+    # Process each tensor
+    output_tensors: dict[str, np.ndarray] = {}
+    transform_records: list[dict] = []
+    report_rows: list[dict] = []
+
+    for name, trec in artifact.tensors.items():
+        arr = trec.data
+        orig_bytes = arr.nbytes
+
+        # Filter
+        if not _tensor_matches(name, select, exclude):
+            output_tensors[name] = arr
+            report_rows.append({
+                "name": name, "shape": arr.shape, "dtype": str(arr.dtype),
+                "size_original": orig_bytes, "skipped": True, "reason": "not selected",
+            })
+            transform_records.append(_passthrough_record(name, arr))
+            continue
+
+        if orig_bytes < min_size_bytes:
+            output_tensors[name] = arr
+            report_rows.append({
+                "name": name, "shape": arr.shape, "dtype": str(arr.dtype),
+                "size_original": orig_bytes, "skipped": True, "reason": "below --min-size",
+            })
+            transform_records.append(_passthrough_record(name, arr))
+            continue
+
+        # Apply sparsify first (if set)
+        if sparsify_threshold is not None:
+            coo_arrays, coo_meta = sparsify(arr, sparsify_threshold)
+            for suffix, sub_arr in coo_arrays.items():
+                output_tensors[f"{name}{suffix}"] = sub_arr
+            stored_bytes = sum(a.nbytes for a in coo_arrays.values())
+            rec = {
+                "name": name,
+                **coo_meta,
+                "size_original_bytes": orig_bytes,
+                "size_stored_bytes": stored_bytes,
+                "compression_ratio": orig_bytes / (stored_bytes + 1e-12),
+                "reconstruction_error_mse": 0.0,
+                "reconstruction_error_relative": 0.0,
+                "keys": [f"{name}{s}" for s in coo_arrays],
+            }
+            transform_records.append(rec)
+            report_rows.append({
+                "name": name, "shape": arr.shape, "dtype": str(arr.dtype),
+                "size_original": orig_bytes, "size_stored": stored_bytes,
+                "transform": f"sparsify threshold={sparsify_threshold}",
+                "mse": 0.0, "rel_err": 0.0,
+            })
+            # Use sparsified arr for any further transform
+            arr = arr.copy()
+            arr[np.abs(arr) < sparsify_threshold] = 0.0
+            if quantize is None:
+                continue
+
+        # Apply quantize
+        if quantize == "fp16":
+            q_arr, q_meta = quantize_fp16(arr)
+            stored_bytes = q_arr.nbytes
+            restored = q_arr.astype(arr.dtype)
+            mse, rel = _reconstruction_errors(arr, restored)
+            output_tensors[name] = q_arr
+            rec = {
+                "name": name,
+                **q_meta,
+                "original_shape": list(arr.shape),
+                "size_original_bytes": orig_bytes,
+                "size_stored_bytes": stored_bytes,
+                "compression_ratio": orig_bytes / (stored_bytes + 1e-12),
+                "reconstruction_error_mse": mse,
+                "reconstruction_error_relative": rel,
+                "keys": [name],
+            }
+            transform_records.append(rec)
+            report_rows.append({
+                "name": name, "shape": arr.shape, "dtype": str(arr.dtype),
+                "size_original": orig_bytes, "size_stored": stored_bytes,
+                "transform": "quantize fp16",
+                "mse": mse, "rel_err": rel,
+            })
+
+        elif quantize == "int8":
+            q_arr, q_meta = quantize_int8(arr)
+            stored_bytes = q_arr.nbytes
+            restored = dequantize_int8(q_arr, q_meta["scale"], q_meta["zero_point"], arr.dtype)
+            mse, rel = _reconstruction_errors(arr, restored)
+            output_tensors[name] = q_arr
+            rec = {
+                "name": name,
+                **q_meta,
+                "original_shape": list(arr.shape),
+                "size_original_bytes": orig_bytes,
+                "size_stored_bytes": stored_bytes,
+                "compression_ratio": orig_bytes / (stored_bytes + 1e-12),
+                "reconstruction_error_mse": mse,
+                "reconstruction_error_relative": rel,
+                "keys": [name],
+            }
+            transform_records.append(rec)
+            report_rows.append({
+                "name": name, "shape": arr.shape, "dtype": str(arr.dtype),
+                "size_original": orig_bytes, "size_stored": stored_bytes,
+                "transform": "quantize int8",
+                "mse": mse, "rel_err": rel,
+            })
+
+        elif sparsify_threshold is None:
+            # No transform specified — pass through
+            output_tensors[name] = arr
+            transform_records.append(_passthrough_record(name, arr))
+            report_rows.append({
+                "name": name, "shape": arr.shape, "dtype": str(arr.dtype),
+                "size_original": orig_bytes, "skipped": True, "reason": "no transform specified",
+            })
+
+    # Global stats
+    total_orig  = sum(r.get("size_original_bytes", r.get("size_original", 0))
+                      for r in transform_records)
+    total_stored = sum(r.get("size_stored_bytes", r.get("size_original_bytes", 0))
+                       for r in transform_records)
+
+    global_stats = {
+        "total_tensors": len(artifact.tensors),
+        "total_parameters": sum(t.data.size for t in artifact.tensors.values()),
+        "original_size_bytes": total_orig,
+        "tensor_transformed_size_bytes": total_stored,
+        "compressed_size_bytes": total_stored,  # updated after pack
+        "compression_ratio_tensor_aware": total_orig / (total_stored + 1e-12),
+        "compression_ratio_binary": 1.0,
+        "compression_ratio_total": total_orig / (total_stored + 1e-12),
+    }
+
+    manifest = build_manifest(artifact, transform_records, global_stats, binary_method=binary_compress)
+
+    if report:
+        _print_transform_report(report_rows, out_path if not dry_run else None, dry_run)
+
+    if not dry_run:
+        pack(output_tensors, manifest, out_path, compression=binary_compress, level=binary_level)
+        final_size = os.path.getsize(out_path)
+        if report:
+            rprint(f"  Final .stz size: [bold]{fmt_bytes(final_size)}[/bold]")
 
 
 @app.command()
