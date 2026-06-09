@@ -617,6 +617,9 @@ requires-dist = [
 ]
 provides-extras = ["torch", "wavelet"]
 
+[package.metadata.requires-dev]
+dev = []
+
 [[package]]
 name = "sympy"
 version = "1.14.0"
