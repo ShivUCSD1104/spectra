@@ -1,7 +1,7 @@
 [project]
 name = "spectra"
 version = "0.1.0"
-description = "Add your description here"
+description = "Command-line tool for analyzing, transforming, and compressing tensor artifacts (.npy, .npz). Profiles sparsity, entropy, and spectral structure per tensor, then routes each to optimal compression (fp16, int8, sparse COO, SVD)."
 readme = "README.md"
 authors = [
     { name = "ShivUCSD1104", email = "shm010@ucsd.edu" }
