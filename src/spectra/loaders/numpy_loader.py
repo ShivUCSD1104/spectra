@@ -49,5 +49,8 @@ def load(path: str) -> Artifact:
         return load_npy(path)
     elif ext == ".npz":
         return load_npz(path)
+    elif ext == ".stz":
+        from spectra.loaders.stz_loader import load_stz
+        return load_stz(path)
     else:
-        raise ValueError(f"Unsupported format '{ext}'. Supported: .npy, .npz")
+        raise ValueError(f"Unsupported format '{ext}'. Supported: .npy, .npz, .stz")
