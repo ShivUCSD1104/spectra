@@ -85,14 +85,17 @@ def route_tensor(
         # Two triggers: fast exponential decay OR strong energy concentration (sharp rank cliff)
         if not no_factorize and not lossless_only:
             rank = find_rank_for_tolerance(S, arr, tolerance)
+            tolerance_satisfiable = rank < len(S)  # len(S) → tolerance unmet within partial SVD
             svd_size = (arr.shape[0] * rank + rank + rank * arr.shape[1]) * 4  # float32
             ratio = arr.nbytes / (svd_size + 1e-12)
-            energy_fraction = float(np.sum(S[:rank] ** 2) / (np.sum(S ** 2) + 1e-12))
             rank_fraction = rank / min(arr.shape)
 
             svd_candidate = (
-                decay > 0.85                       # fast exponential decay
-                or (rank_fraction < 0.3 and ratio > 2.0)  # sharp rank cliff → good compression
+                tolerance_satisfiable              # tolerance can actually be met
+                and (
+                    decay > 0.85                   # fast exponential decay
+                    or (rank_fraction < 0.3 and ratio > 2.0)  # sharp rank cliff → good compression
+                )
             )
             if svd_candidate and ratio > 2.0:
                 return {

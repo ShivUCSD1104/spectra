@@ -83,21 +83,32 @@ def find_rank_for_tolerance(
 ) -> int:
     """Find the smallest rank k where SVD relative reconstruction error < tolerance.
 
-    Uses the Eckart-Young theorem:
-        relative_error(k) = sqrt(sum(S[k:]^2) / sum(S^2))
+    Uses the Eckart-Young theorem with the TRUE Frobenius norm of arr as the
+    energy denominator (not sum(S**2), which is only the partial SVD energy):
 
-    Falls back to full rank if no k satisfies the tolerance.
+        relative_error(k) = sqrt(1 - sum(S[:k]**2) / ||arr||_F**2)
+
+    S must be sorted in descending order (standard SVD convention).
+    Falls back to len(S) if no rank within the captured singular values satisfies
+    the tolerance — the caller should treat this as "SVD not viable at this k".
     """
-    total_energy = float(np.sum(S ** 2))
+    # Use the true Frobenius norm of the original array as the energy denominator.
+    # S is a partial SVD (top-k values only); using sum(S**2) would underestimate
+    # the total spectral energy for matrices with broadly distributed spectra
+    # (e.g. BERT attention weights), causing the required rank to be massively
+    # under-estimated and the tolerance guarantee to be violated.
+    total_energy = float(np.linalg.norm(arr.ravel()) ** 2)
     if total_energy == 0:
         return 1
 
-    tail_energy = np.cumsum(S[::-1] ** 2)[::-1]  # tail sum from index k onward
-    rel_errors = np.sqrt(tail_energy / total_energy)
+    # Energy captured by keeping the top-k singular values (cumulative from rank 1)
+    captured_energy = np.cumsum(S ** 2)
+    # Relative error at rank k = sqrt(1 - captured(k) / total)
+    rel_errors = np.sqrt(np.maximum(0.0, 1.0 - captured_energy / total_energy))
 
-    # Find first k where rel_error drops below tolerance
-    # rel_errors[k] is the error when using rank k
+    # rel_errors[i] = error when using rank i+1.
+    # Find first index where error drops below tolerance → rank = index + 1.
     passing = np.where(rel_errors < tolerance)[0]
     if len(passing) == 0:
-        return len(S)  # need full rank
-    return max(1, int(passing[0]))
+        return len(S)  # even full captured rank is insufficient (matrix needs more than k SVs)
+    return max(1, int(passing[0]) + 1)
