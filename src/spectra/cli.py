@@ -413,7 +413,7 @@ def transform(
     file: str = typer.Argument(..., help="Input file (.npy, .npz)"),
     out: Optional[str] = typer.Option(None, "--out", help="Output .stz path (default: <input>.stz)"),
     quantize: Optional[str] = typer.Option(None, "--quantize", help="fp16 | int8"),
-    factorize: Optional[str] = typer.Option(None, "--factorize", help="svd | tucker (Phase 13)"),
+    factorize: Optional[str] = typer.Option(None, "--factorize", help="svd (tucker coming soon)"),
     rank: Optional[int] = typer.Option(None, "--rank", help="Fixed SVD rank"),
     sparsify_threshold: Optional[float] = typer.Option(None, "--sparsify", help="Zero out abs(x) < threshold"),
     select: Optional[str] = typer.Option(None, "--select", help="Glob pattern to select tensors"),
@@ -430,8 +430,8 @@ def transform(
     # --factorize tucker not yet available
     if factorize is not None and factorize not in ("svd",):
         typer.echo(
-            f"Error: --factorize {factorize} is not yet implemented. "
-            "Supported: svd. Tucker is added in Phase 14.",
+            f"Error: --factorize {factorize!r} is not yet supported. "
+            "Currently supported: svd. Tucker decomposition is coming soon.",
             err=True,
         )
         raise typer.Exit(1)
@@ -642,7 +642,7 @@ def compress(
     lossless_only: bool = typer.Option(False, "--lossless-only/--no-lossless-only"),
     no_factorize: bool = typer.Option(False, "--no-factorize/--factorize"),
     no_quantize: bool = typer.Option(False, "--no-quantize/--quantize"),
-    wavelet: bool = typer.Option(False, "--wavelet/--no-wavelet", help="Wavelet preconditioning (Phase 15)"),
+    wavelet: bool = typer.Option(False, "--wavelet/--no-wavelet", help="Wavelet preconditioning (coming soon, requires spectra[wavelet])"),
     wavelet_basis: str = typer.Option("db4", "--wavelet-basis"),
     spatial_dims: int = typer.Option(3, "--spatial-dims"),
     min_size: str = typer.Option("0", "--min-size"),
@@ -881,7 +881,7 @@ def extract(
         if storage in _NOT_YET:
             typer.echo(
                 f"Error: storage_type '{storage}' for tensor '{name}' "
-                "requires SVD/Tucker (Phase 13). Cannot extract yet.",
+                "requires Tucker support (coming soon). Cannot extract yet.",
                 err=True,
             )
             raise typer.Exit(1)

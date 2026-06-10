@@ -38,7 +38,7 @@ def load_stz(path: str) -> Artifact:
         if storage in _NOT_YET:
             raise NotImplementedError(
                 f"Cannot load tensor '{name}': storage_type '{storage}' "
-                "requires SVD/Tucker support (Phase 13)."
+                "requires Tucker support (coming soon)."
             )
 
         orig_dtype = np.dtype(meta["original_dtype"])
