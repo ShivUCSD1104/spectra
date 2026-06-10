@@ -245,11 +245,15 @@ def inspect(
     # Header
     total_params = sum(r["params"] for r in records)
     total_bytes = sum(r["size_bytes"] for r in records)
+    # For machine-readable formats (json/csv) send the header to stderr so
+    # stdout contains only parseable output.
+    header_target = sys.stderr if format in ("json", "csv") else sys.stdout
     rprint(
         f"\n[bold]File:[/bold] {file}  |  "
         f"[bold]{len(records)}[/bold] tensors  |  "
         f"[bold]{_fmt_params(total_params)}[/bold] parameters  |  "
-        f"[bold]{fmt_bytes(total_bytes)}[/bold]\n"
+        f"[bold]{fmt_bytes(total_bytes)}[/bold]\n",
+        file=header_target,
     )
 
     # Render
