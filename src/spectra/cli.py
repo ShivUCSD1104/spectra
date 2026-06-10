@@ -730,7 +730,86 @@ def extract(
 
 
 @app.command()
-def info(file: str = typer.Argument(...)):
-    """Display manifest of a .stz without decompressing. (Phase 11)"""
-    typer.echo("info: not yet implemented", err=True)
-    raise typer.Exit(1)
+def info(
+    file: str = typer.Argument(..., help="Path to .stz archive"),
+    json_out: bool = typer.Option(False, "--json/--no-json", help="Raw JSON output"),
+    tensor: Optional[str] = typer.Option(None, "--tensor", help="Info for one tensor only"),
+):
+    """Display the manifest of a .stz archive without decompressing tensors."""
+
+    try:
+        manifest = unpack_manifest(file)
+    except Exception as e:
+        typer.echo(f"Error reading archive: {e}", err=True)
+        raise typer.Exit(1)
+
+    # ── raw JSON mode ─────────────────────────────────────────────────────────
+    if json_out:
+        if tensor is not None:
+            entry = manifest.get("tensors", {}).get(tensor)
+            if entry is None:
+                typer.echo(f"Tensor '{tensor}' not found.", err=True)
+                raise typer.Exit(1)
+            print(json.dumps({tensor: entry}, indent=2))
+        else:
+            print(json.dumps(manifest, indent=2))
+        return
+
+    # ── single tensor info ────────────────────────────────────────────────────
+    if tensor is not None:
+        entry = manifest.get("tensors", {}).get(tensor)
+        if entry is None:
+            typer.echo(f"Tensor '{tensor}' not found in archive.", err=True)
+            raise typer.Exit(1)
+        rprint(f"\n[bold cyan]{tensor}[/bold cyan]")
+        for k, v in entry.items():
+            rprint(f"  {k:<35} {v}")
+        return
+
+    # ── full summary display ──────────────────────────────────────────────────
+    gs = manifest.get("global_stats", {})
+    tensors_meta = manifest.get("tensors", {})
+    created = manifest.get("created_at", "")[:10]  # date only
+    source = os.path.basename(manifest.get("source_file", ""))
+    version = manifest.get("spectra_version", "?")
+
+    rprint(f"\n[bold]Spectra Archive:[/bold] {os.path.basename(file)}")
+    rprint(f"Created: {created}  |  Source: {source}  |  Version: {version}")
+
+    # Storage summary
+    orig_bytes     = gs.get("original_size_bytes", 0)
+    tensor_bytes   = gs.get("tensor_transformed_size_bytes", orig_bytes)
+    compressed     = gs.get("compressed_size_bytes", tensor_bytes)
+    ratio_tensor   = gs.get("compression_ratio_tensor_aware", orig_bytes / (tensor_bytes + 1e-12))
+    ratio_binary   = gs.get("compression_ratio_binary", tensor_bytes / (compressed + 1e-12))
+    ratio_total    = gs.get("compression_ratio_total", orig_bytes / (compressed + 1e-12))
+    binary_method  = gs.get("binary_compression_method", "?")
+    total_tensors  = gs.get("total_tensors", len(tensors_meta))
+
+    rprint(f"\n[bold]Storage Summary[/bold]")
+    rprint(f"  {total_tensors} tensors")
+    rprint(f"  Original:                {fmt_bytes(orig_bytes):>10}")
+    rprint(f"  After tensor transforms: {fmt_bytes(tensor_bytes):>10}  ({ratio_tensor:.1f}x)")
+    rprint(f"  After binary ({binary_method}):  {fmt_bytes(compressed):>10}  ({ratio_binary:.1f}x)")
+    rprint(f"  Total ratio:             {ratio_total:.1f}x")
+
+    # Strategy breakdown
+    from collections import defaultdict
+    by_storage: dict[str, list] = defaultdict(list)
+    for name, meta in tensors_meta.items():
+        by_storage[meta.get("storage_type", "dense")].append(meta)
+
+    rprint(f"\n[bold]Strategy Breakdown[/bold]")
+    for storage, entries in sorted(by_storage.items(), key=lambda x: -len(x[1])):
+        total_orig = sum(e.get("size_original_bytes", 0) for e in entries)
+        rprint(f"  {storage:<18} {len(entries):>4} tensors  ({fmt_bytes(total_orig)} original)")
+
+    # Lossy / lossless counts + max MSE
+    lossy    = [m for m in tensors_meta.values() if not m.get("lossless", True)]
+    lossless = [m for m in tensors_meta.values() if m.get("lossless", True)]
+    all_mse  = [m.get("reconstruction_error_mse", 0.0) for m in tensors_meta.values()
+                if m.get("reconstruction_error_mse") is not None]
+
+    rprint(f"\nLossy tensors: {len(lossy)}  |  Lossless tensors: {len(lossless)}")
+    if all_mse:
+        rprint(f"Max stored error (MSE): {max(all_mse):.6f}")
