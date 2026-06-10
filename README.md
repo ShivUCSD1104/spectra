@@ -45,7 +45,7 @@ spectra info      <file.stz>      Show archive manifest without decompressing.
 
 ---
 
-## Example workflow
+## Usage
 
 A complete inspect → transform → extract round-trip on a four-tensor synthetic model.
 
