@@ -23,8 +23,10 @@ from spectra.analysis.spectrum import (
     spectral_decay_rate,
 )
 from spectra.core.manifest import build_manifest
+from spectra.core.router import route_tensor
 from spectra.formats.stz import pack, unpack_manifest, unpack_tensors
 from spectra.loaders.numpy_loader import load
+from spectra.transforms.factorize import svd_compress, svd_reconstruct, find_rank_for_tolerance
 from spectra.transforms.quantize import quantize_fp16, quantize_int8, dequantize_int8
 from spectra.transforms.sparsify import sparsify, reconstruct_coo
 from spectra.utils.display import make_tensor_table, print_summary_block
@@ -421,14 +423,17 @@ def transform(
 ):
     """Apply explicit transforms to all tensors (or a selection). Outputs a .stz archive."""
 
-    # --factorize not yet available
-    if factorize is not None:
+    # --factorize tucker not yet available
+    if factorize is not None and factorize not in ("svd",):
         typer.echo(
-            "Error: --factorize is not yet implemented. "
-            "SVD/Tucker factorization is added in Phase 13. "
-            "Use --quantize or --sparsify instead.",
+            f"Error: --factorize {factorize} is not yet implemented. "
+            "Supported: svd. Tucker is added in Phase 14.",
             err=True,
         )
+        raise typer.Exit(1)
+
+    if factorize == "svd" and rank is None:
+        typer.echo("Error: --factorize svd requires --rank N", err=True)
         raise typer.Exit(1)
 
     if quantize is not None and quantize not in ("fp16", "int8"):
@@ -501,6 +506,40 @@ def transform(
             arr[np.abs(arr) < sparsify_threshold] = 0.0
             if quantize is None:
                 continue
+
+        # Apply SVD factorize
+        if factorize == "svd" and arr.ndim == 2:
+            cached = artifact._svd_cache.get(name)
+            svd_arrays, svd_meta = svd_compress(arr, rank, cached_svd=cached)
+            for suffix, sub_arr in svd_arrays.items():
+                output_tensors[f"{name}{suffix}"] = sub_arr
+            stored_bytes = sum(a.nbytes for a in svd_arrays.values())
+            rec = {
+                "name": name,
+                **svd_meta,
+                "keys": [f"{name}{s}" for s in svd_arrays],
+                "strategy_reason": f"explicit --factorize svd --rank {rank}",
+            }
+            transform_records.append(rec)
+            report_rows.append({
+                "name": name, "shape": arr.shape, "dtype": str(arr.dtype),
+                "size_original": orig_bytes, "size_stored": stored_bytes,
+                "transform": f"SVD rank={rank}",
+                "mse": svd_meta["reconstruction_error_mse"],
+                "rel_err": svd_meta["reconstruction_error_relative"],
+            })
+            continue
+
+        elif factorize == "svd" and arr.ndim != 2:
+            # skip non-2D for SVD
+            output_tensors[name] = arr
+            transform_records.append(_passthrough_record(name, arr))
+            report_rows.append({
+                "name": name, "shape": arr.shape, "dtype": str(arr.dtype),
+                "size_original": orig_bytes, "skipped": True,
+                "reason": f"SVD skipped ({arr.ndim}D tensor)",
+            })
+            continue
 
         # Apply quantize
         if quantize == "fp16":
@@ -592,10 +631,192 @@ def transform(
 
 
 @app.command()
-def compress(file: str = typer.Argument(...)):
-    """Auto-route each tensor to optimal compression. (Phase 13)"""
-    typer.echo("compress: not yet implemented", err=True)
-    raise typer.Exit(1)
+def compress(
+    file: str = typer.Argument(..., help="Input file (.npy, .npz, .stz)"),
+    out: Optional[str] = typer.Option(None, "--out", help="Output .stz path"),
+    tolerance: float = typer.Option(0.01, "--tolerance", help="Max relative reconstruction error"),
+    lossless_only: bool = typer.Option(False, "--lossless-only/--no-lossless-only"),
+    no_factorize: bool = typer.Option(False, "--no-factorize/--factorize"),
+    no_quantize: bool = typer.Option(False, "--no-quantize/--quantize"),
+    wavelet: bool = typer.Option(False, "--wavelet/--no-wavelet", help="Wavelet preconditioning (Phase 15)"),
+    wavelet_basis: str = typer.Option("db4", "--wavelet-basis"),
+    spatial_dims: int = typer.Option(3, "--spatial-dims"),
+    min_size: str = typer.Option("0", "--min-size"),
+    dry_run: bool = typer.Option(False, "--dry-run/--no-dry-run"),
+    report: bool = typer.Option(True, "--report/--no-report"),
+    report_file: Optional[str] = typer.Option(None, "--report-file"),
+    binary_compress: str = typer.Option("zstd", "--binary-compress"),
+    binary_level: Optional[int] = typer.Option(None, "--binary-level"),
+):
+    """Automatically analyze each tensor and route it to the optimal compression strategy."""
+
+    min_size_bytes = parse_size(min_size)
+    out_path = out or _default_out(file)
+
+    try:
+        artifact = load(file)
+    except Exception as e:
+        typer.echo(f"Error loading file: {e}", err=True)
+        raise typer.Exit(1)
+
+    output_tensors: dict[str, np.ndarray] = {}
+    transform_records: list[dict] = []
+    report_rows: list[dict] = []
+
+    with console.status("[bold green]Routing tensors…"):
+        for name, trec in artifact.tensors.items():
+            arr = trec.data
+            orig_bytes = arr.nbytes
+
+            decision = route_tensor(
+                trec, artifact,
+                tolerance=tolerance,
+                wavelet=wavelet,
+                spatial_dims=spatial_dims,
+                min_size_bytes=min_size_bytes,
+                no_factorize=no_factorize,
+                no_quantize=no_quantize,
+                lossless_only=lossless_only,
+            )
+            strategy = decision["strategy"]
+            params   = decision["params"]
+
+            if strategy == "svd":
+                rank = params["rank"]
+                cached = artifact._svd_cache.get(name)
+                svd_arrays, svd_meta = svd_compress(arr, rank, cached_svd=cached)
+                for suffix, sub_arr in svd_arrays.items():
+                    output_tensors[f"{name}{suffix}"] = sub_arr
+                stored_bytes = svd_meta["size_stored_bytes"]
+                rec = {
+                    "name": name, **svd_meta,
+                    "keys": [f"{name}{s}" for s in svd_arrays],
+                    "strategy_reason": decision["reason"],
+                }
+                transform_records.append(rec)
+                report_rows.append({
+                    "name": name, "shape": arr.shape, "dtype": str(arr.dtype),
+                    "size_original": orig_bytes, "size_stored": stored_bytes,
+                    "transform": f"SVD rank={rank}  ({decision['reason']})",
+                    "mse": svd_meta["reconstruction_error_mse"],
+                    "rel_err": svd_meta["reconstruction_error_relative"],
+                })
+
+            elif strategy == "quantize_fp16":
+                q_arr, q_meta = quantize_fp16(arr)
+                output_tensors[name] = q_arr
+                stored_bytes = q_arr.nbytes
+                rec = {
+                    "name": name, **q_meta,
+                    "original_shape": list(arr.shape),
+                    "size_original_bytes": orig_bytes,
+                    "size_stored_bytes": stored_bytes,
+                    "compression_ratio": orig_bytes / (stored_bytes + 1e-12),
+                    "reconstruction_error_mse": 0.0,
+                    "reconstruction_error_relative": 0.0,
+                    "keys": [name],
+                    "strategy_reason": decision["reason"],
+                }
+                transform_records.append(rec)
+                restored = q_arr.astype(arr.dtype)
+                mse, rel = _reconstruction_errors(arr, restored)
+                report_rows.append({
+                    "name": name, "shape": arr.shape, "dtype": str(arr.dtype),
+                    "size_original": orig_bytes, "size_stored": stored_bytes,
+                    "transform": f"fp16  ({decision['reason']})",
+                    "mse": mse, "rel_err": rel,
+                })
+
+            elif strategy == "quantize_int8":
+                q_arr, q_meta = quantize_int8(arr)
+                output_tensors[name] = q_arr
+                stored_bytes = q_arr.nbytes
+                restored = dequantize_int8(q_arr, q_meta["scale"], q_meta["zero_point"], arr.dtype)
+                mse, rel = _reconstruction_errors(arr, restored)
+                rec = {
+                    "name": name, **q_meta,
+                    "original_shape": list(arr.shape),
+                    "size_original_bytes": orig_bytes,
+                    "size_stored_bytes": stored_bytes,
+                    "compression_ratio": orig_bytes / (stored_bytes + 1e-12),
+                    "reconstruction_error_mse": mse,
+                    "reconstruction_error_relative": rel,
+                    "keys": [name],
+                    "strategy_reason": decision["reason"],
+                }
+                transform_records.append(rec)
+                report_rows.append({
+                    "name": name, "shape": arr.shape, "dtype": str(arr.dtype),
+                    "size_original": orig_bytes, "size_stored": stored_bytes,
+                    "transform": f"int8  ({decision['reason']})",
+                    "mse": mse, "rel_err": rel,
+                })
+
+            elif strategy == "sparse_coo":
+                threshold = params.get("threshold", 1e-6)
+                coo_arrays, coo_meta = sparsify(arr, threshold)
+                for suffix, sub_arr in coo_arrays.items():
+                    output_tensors[f"{name}{suffix}"] = sub_arr
+                stored_bytes = sum(a.nbytes for a in coo_arrays.values())
+                rec = {
+                    "name": name, **coo_meta,
+                    "size_original_bytes": orig_bytes,
+                    "size_stored_bytes": stored_bytes,
+                    "compression_ratio": orig_bytes / (stored_bytes + 1e-12),
+                    "reconstruction_error_mse": 0.0,
+                    "reconstruction_error_relative": 0.0,
+                    "keys": [f"{name}{s}" for s in coo_arrays],
+                    "strategy_reason": decision["reason"],
+                }
+                transform_records.append(rec)
+                report_rows.append({
+                    "name": name, "shape": arr.shape, "dtype": str(arr.dtype),
+                    "size_original": orig_bytes, "size_stored": stored_bytes,
+                    "transform": f"sparse COO  ({decision['reason']})",
+                    "mse": 0.0, "rel_err": 0.0,
+                })
+
+            else:  # dense passthrough
+                output_tensors[name] = arr
+                transform_records.append(_passthrough_record(name, arr))
+                report_rows.append({
+                    "name": name, "shape": arr.shape, "dtype": str(arr.dtype),
+                    "size_original": orig_bytes, "skipped": True,
+                    "reason": decision["reason"],
+                })
+
+    # Global stats
+    total_orig   = sum(r.get("size_original_bytes", r.get("size_original", 0)) for r in transform_records)
+    total_stored = sum(r.get("size_stored_bytes", r.get("size_original_bytes", 0)) for r in transform_records)
+    global_stats = {
+        "total_tensors": len(artifact.tensors),
+        "total_parameters": sum(t.data.size for t in artifact.tensors.values()),
+        "original_size_bytes": total_orig,
+        "tensor_transformed_size_bytes": total_stored,
+        "compressed_size_bytes": total_stored,
+        "compression_ratio_tensor_aware": total_orig / (total_stored + 1e-12),
+        "compression_ratio_binary": 1.0,
+        "compression_ratio_total": total_orig / (total_stored + 1e-12),
+    }
+    manifest = build_manifest(artifact, transform_records, global_stats, binary_method=binary_compress)
+
+    if report:
+        _print_transform_report(report_rows, out_path if not dry_run else None, dry_run)
+
+    if report_file:
+        ext = os.path.splitext(report_file)[1].lower()
+        with open(report_file, "w") as f:
+            if ext == ".json":
+                json.dump({"rows": report_rows, "global_stats": global_stats}, f, indent=2)
+            else:
+                for r in report_rows:
+                    f.write(f"{r['name']}: {r.get('transform', 'skipped')}\n")
+
+    if not dry_run:
+        pack(output_tensors, manifest, out_path, compression=binary_compress, level=binary_level)
+        final_size = os.path.getsize(out_path)
+        if report:
+            rprint(f"  Final .stz size: [bold]{fmt_bytes(final_size)}[/bold]")
 
 
 @app.command()
@@ -645,7 +866,7 @@ def extract(
         raise typer.Exit(1)
 
     # Reconstruct each tensor
-    _NOT_YET = {"svd", "tucker", "tucker_wavelet", "svd_wavelet"}
+    _NOT_YET = {"tucker", "tucker_wavelet", "svd_wavelet"}
 
     reconstructed: dict[str, np.ndarray] = {}
     report_rows: list[dict] = []
@@ -677,6 +898,14 @@ def extract(
             q = raw[meta["keys"][0]]
             arr = dequantize_int8(q, meta["scale"], meta["zero_point"],
                                   orig_dtype if orig_dtype is not None else np.float32)
+
+        elif storage == "svd":
+            U  = raw[f"{name}__U"].astype(np.float64)
+            S  = raw[f"{name}__S"].astype(np.float64)
+            Vt = raw[f"{name}__Vt"].astype(np.float64)
+            arr = svd_reconstruct(U, S, Vt)
+            if orig_dtype is not None:
+                arr = arr.astype(orig_dtype)
 
         elif storage == "sparse_coo":
             indices = raw[f"{name}__indices"]

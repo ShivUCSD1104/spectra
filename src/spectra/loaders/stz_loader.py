@@ -6,10 +6,11 @@ import numpy as np
 
 from spectra.core.artifact import Artifact, TensorRecord
 from spectra.formats.stz import unpack_manifest, unpack_tensors
+from spectra.transforms.factorize import svd_reconstruct
 from spectra.transforms.quantize import dequantize_int8
 from spectra.transforms.sparsify import reconstruct_coo
 
-_NOT_YET = {"svd", "tucker", "tucker_wavelet", "svd_wavelet"}
+_NOT_YET = {"tucker", "tucker_wavelet", "svd_wavelet"}
 
 
 def load_stz(path: str) -> Artifact:
@@ -51,6 +52,12 @@ def load_stz(path: str) -> Artifact:
         elif storage == "quantized_int8":
             q = raw[meta["keys"][0]]
             arr = dequantize_int8(q, meta["scale"], meta["zero_point"], orig_dtype)
+
+        elif storage == "svd":
+            U  = raw[f"{name}__U"].astype(np.float64)
+            S  = raw[f"{name}__S"].astype(np.float64)
+            Vt = raw[f"{name}__Vt"].astype(np.float64)
+            arr = svd_reconstruct(U, S, Vt).astype(orig_dtype)
 
         elif storage == "sparse_coo":
             indices = raw[f"{name}__indices"]
