@@ -1,5 +1,5 @@
 [project]
-name = "spectra"
+name = "stz"
 version = "0.1.0"
 description = "Command-line tool for analyzing, transforming, and compressing tensor artifacts (.npy, .npz). Profiles sparsity, entropy, and spectral structure per tensor, then routes each to optimal compression (fp16, int8, sparse COO, SVD)."
 readme = "README.md"

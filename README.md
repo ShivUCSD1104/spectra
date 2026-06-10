@@ -8,26 +8,27 @@ Designed for data scientists who need to shrink model weights, activation checkp
 
 ## Installation
 
-Requires Python 3.12+, managed with [uv](https://github.com/astral-sh/uv).
+```bash
+pip install stz
+```
+
+Or with [uv](https://github.com/astral-sh/uv):
+
+```bash
+uv add stz
+```
+
+Or directly from GitHub (latest unreleased):
 
 ```bash
 uv add "git+https://github.com/ShivUCSD1104/spectra.git"
 ```
 
-Or clone and install in editable mode:
-
-```bash
-git clone https://github.com/ShivUCSD1104/spectra.git
-cd spectra
-uv sync
-uv run spectra --help
-```
-
 Optional extras:
 
 ```bash
-uv add "spectra[torch]"    # enable .pt / .pth loading (requires PyTorch)
-uv add "spectra[wavelet]"  # enable wavelet preconditioning (requires PyWavelets)
+pip install "stz[torch]"    # enable .pt / .pth loading (requires PyTorch)
+pip install "stz[wavelet]"  # enable wavelet preconditioning (requires PyWavelets)
 ```
 
 ---
